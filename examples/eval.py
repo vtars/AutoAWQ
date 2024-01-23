@@ -20,11 +20,14 @@ def run_eval(
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
-    # Load adapter
+    # # Load adapter
     tasks = tasks.split(',')
+    # wikitext v2
     if len(tasks) == 1 and tasks[0] == 'wikitext':
-        evaluate_perplexity(model.model, tokenizer)
-
+        if task_use_pretrained:
+            model.model = model.model.to(device)
+        result = evaluate_perplexity(model.model, tokenizer)
+        print(result)
     else:
         lm_eval_model = LMEvalAdaptor(model_path, model, tokenizer, device, batch_size=task_batch_size)
 
@@ -57,8 +60,8 @@ if __name__ == '__main__':
     parser.add_argument("--pretrained_safetensors", default=False, action='store_true',
                         help="Load safetensors for FP16 model")
     parser.add_argument('--tasks', type=str, default='wikitext', help='Tasks to evaluate. '
-                    'Separate tasks by comma for multiple tasks.'
-                    'https://github.com/EleutherAI/lm-evaluation-harness/blob/master/docs/task_table.md')
+                        'Separate tasks by comma for multiple tasks.'
+                        'https://github.com/EleutherAI/lm-evaluation-harness/blob/master/docs/task_table.md')
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--n_shot', type=int, default=0)
     args = parser.parse_args()

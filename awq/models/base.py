@@ -52,9 +52,12 @@ class BaseAWQForCausalLM(nn.Module):
                        split="train", text_column="text", duo_scaling=True, modules_to_not_convert=None):
         self.quant_config: AwqConfig = AwqConfig.from_dict(quant_config)
 
+        print("==> self.quant_config: {}".format(self.quant_config))
         quantizer = AwqQuantizer(
             self, self.model, tokenizer, self.quant_config.w_bit, self.quant_config.q_group_size,
-            self.quant_config.version, calib_data, split, text_column, duo_scaling, modules_to_not_convert=modules_to_not_convert
+            self.quant_config.version, self.quant_config.visualize, self.quant_config.vis_path,
+            calib_data, split, text_column,
+            duo_scaling, modules_to_not_convert=modules_to_not_convert
         )
         quantizer.quantize()
         self.is_quantized = True

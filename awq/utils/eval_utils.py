@@ -9,8 +9,10 @@ def evaluate_perplexity(model, tokenizer):
     
     # load and prepare dataset
     data = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
+    print("==> load dataset done")
     data = tokenizer("\n\n".join(data['text']), return_tensors='pt')
     data = data.input_ids.to(model.device)
+    print("==> load tokenizer done")
 
     seqlen = 2048
     model = model.eval()

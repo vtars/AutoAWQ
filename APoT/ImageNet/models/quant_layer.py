@@ -10,23 +10,31 @@ import torch.nn.functional as F
 
 # this function construct an additive pot quantization levels set, with clipping threshold = 1,
 def build_power_value(B=2, additive=True):
+    # use k = 2, kn = B
+    # range => (2^k - 2)/k + 1 => range(3) 012
     base_a = [0.]
     base_b = [0.]
     base_c = [0.]
     if additive:
         if B == 2:
+            # k = 2, n = 1
+            # range 0 1 2
             for i in range(3):
                 base_a.append(2 ** (-i - 1))
         elif B == 4:
+            # k = 2, n = 2
+            # range 0 1 2
             for i in range(3):
                 base_a.append(2 ** (-2 * i - 1))
                 base_b.append(2 ** (-2 * i - 2))
         elif B == 6:
+            # k = 2, n = 3
             for i in range(3):
                 base_a.append(2 ** (-3 * i - 1))
                 base_b.append(2 ** (-3 * i - 2))
                 base_c.append(2 ** (-3 * i - 3))
         elif B == 3:
+            # k = 2, n = 1
             for i in range(3):
                 if i < 2:
                     base_a.append(2 ** (-i - 1))
@@ -34,6 +42,7 @@ def build_power_value(B=2, additive=True):
                     base_b.append(2 ** (-i - 1))
                     base_a.append(2 ** (-i - 2))
         elif B == 5:
+            # k = 2, n = 1
             for i in range(3):
                 if i < 2:
                     base_a.append(2 ** (-2 * i - 1))
@@ -69,13 +78,15 @@ def apot_quantization(tensor, alpha, proj_set, is_weight=True, grad_scale=None):
         if is_weight:
             shape = x.shape
             xhard = x.view(-1)
-            sign = x.sign()
+            sign = x.sign()  # 返回符号（-1, 0, 1）
             value_s = value_s.type_as(x)
             xhard = xhard.abs()
             idxs = (xhard.unsqueeze(0) - value_s.unsqueeze(1)).abs().min(dim=0)[1]
             xhard = value_s[idxs].view(shape).mul(sign)
             xhard = xhard
         else:
+            # activation
+            # no sign
             shape = x.shape
             xhard = x.view(-1)
             value_s = value_s.type_as(x)
@@ -126,6 +137,8 @@ def uq_with_calibrated_graditens(grad_scale=None):
 
 
 def uniform_quantization(tensor, alpha, bit, is_weight=True, grad_scale=None):
+    # for weight => quant in [-1, 1]
+    # for activation => quant in [0, 1]
     if grad_scale:
         alpha = gradient_scale(alpha, grad_scale)
     data = tensor / alpha
@@ -152,7 +165,8 @@ class QuantConv2d(nn.Conv2d):
 
     procedure:
         1. determine if the bitwidth is illegal
-        2. if using PoT quantization, then build projection set. (For 2-bit weights quantization, PoT = Uniform)
+        2. if using PoT quantization, then build projection set.
+            (For 2-bit weights quantization, PoT = Uniform)
         3. generate the clipping thresholds
 
     forward:
@@ -171,8 +185,11 @@ class QuantConv2d(nn.Conv2d):
         self.grad_scale = grad_scale
         if power:
             if self.bit > 2:
+                # weight has sign (-1, 1), so B = bit - 1
                 self.proj_set_weight = build_power_value(B=self.bit - 1, additive=additive)
             self.proj_set_act = build_power_value(B=self.bit, additive=additive)
+
+        # para to learned
         self.act_alpha = torch.nn.Parameter(torch.tensor(6.0))
         self.weight_alpha = torch.nn.Parameter(torch.tensor(3.0))
 
@@ -180,10 +197,12 @@ class QuantConv2d(nn.Conv2d):
         if self.bit == 32:
             return F.conv2d(x, self.weight, self.bias, self.stride,
                             self.padding, self.dilation, self.groups)
+
         # weight normalization
         mean = self.weight.mean()
         std = self.weight.std()
         weight = self.weight.add(-mean).div(std)
+
         if self.power:
             if self.bit > 2:
                 weight = apot_quantization(weight, self.weight_alpha, self.proj_set_weight, True, self.grad_scale)

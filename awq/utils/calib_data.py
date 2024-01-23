@@ -6,6 +6,7 @@ from datasets import load_dataset
 def get_calib_dataset(data: Union[str, List[str]] = "pileval",
                       tokenizer=None, n_samples=512, block_size=512,
                       split="train", text_column="text"):
+    print("==> get_calib_dataset")
     if isinstance(data, str):
         if data == "pileval":
             dataset = load_dataset("mit-han-lab/pile-val-backup", split="validation")
