@@ -1,0 +1,11 @@
+env
+*.pyc
+data/
+lm_cache
+.idea
+tests
+experiment
+lj_exp
+lj_experiment
+lm_eval.egg-info/
+
