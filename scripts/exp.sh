@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=1 python examples/basic_quant.py --quant_path /home/dixiang/hsx/projects/AutoAWQ/output/test-llama-7b-aq --a_quant
