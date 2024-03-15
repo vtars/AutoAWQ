@@ -12,7 +12,10 @@ class AwqConfig(PushToHubMixin):
     quant_method: str = field(default="awq")
     zero_point: bool = field(default=True)
     q_group_size: int = field(default=128)
+    rtn_q: bool = field(default=False)
     w_bit: int = field(default=4)
+    a_quant: bool = field(default=False)
+    a_bit: int = field(default=16)
     version: str = field(default="GEMM")
     config_file_name = "quant_config.json"
     modules_to_not_convert: Optional[List] = None
@@ -78,11 +81,14 @@ class AwqConfig(PushToHubMixin):
         return {
             "zero_point": self.zero_point,
             "q_group_size": self.q_group_size,
+            "rtn_q": self.rtn_q,
             "w_bit": self.w_bit,
             "version": self.version,
             "modules_to_not_convert": self.modules_to_not_convert,
             "visualize": self.visualize,
             "vis_path": self.vis_path,
+            "a_quant": self.a_quant,
+            "a_bit": self.a_bit,
         }
 
     def to_transformers_dict(self):
@@ -93,4 +99,9 @@ class AwqConfig(PushToHubMixin):
             "bits": self.w_bit,
             "version": self.version.lower(),
             "modules_to_not_convert": self.modules_to_not_convert,
+            "visualize": self.visualize,
+            "vis_path": self.vis_path,
+            "rtn_q": self.rtn_q,
+            "a_quant": self.a_quant,
+            "a_bit": self.a_bit,
         }

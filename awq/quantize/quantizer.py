@@ -1,10 +1,12 @@
 import os
+import random
 
 import torch
 import inspect
 import logging
 import functools
 import matplotlib.pyplot as plt
+import matplotlib as mpl
 import torch.nn as nn
 from tqdm import tqdm
 from typing import Dict, List
@@ -17,15 +19,21 @@ from awq.utils.module import append_str_prefix, get_op_name, get_named_linears, 
 
 
 class AwqQuantizer:
-    def __init__(self, awq_model, model, tokenizer, w_bit, group_size, version, visualize, vis_path,
-                       calib_data, split, text_column, duo_scaling, modules_to_not_convert=None) -> None:
+    def __init__(self, awq_model, model, tokenizer, rtn_q, w_bit, a_quant, a_bit,
+                 group_size, version, visualize, vis_path,
+                 calib_data, split, text_column, duo_scaling, modules_to_not_convert=None) -> None:
         self.quanting_layer_idx = None
         self.max_channel_idxes = []
         self.min_channel_idxes = []
         self.awq_model = awq_model
         self.model = model
         self.tokenizer = tokenizer
+
+        self.rtn_q = rtn_q
         self.w_bit = w_bit
+        self.a_quant = a_quant
+        self.a_bit = a_bit
+
         self.group_size = group_size
         self.version = version
 
@@ -38,8 +46,17 @@ class AwqQuantizer:
         self.duo_scaling = duo_scaling
         self.modules_to_not_convert = modules_to_not_convert if modules_to_not_convert is not None else []
         self.modules, self.module_kwargs, self.inps = self.init_quant()
-    
-    def pseudo_quantize_tensor(self, w: torch.Tensor, layer_name, get_scale_zp=False, scaled=False, ori_w=False):
+
+    def pseudo_quantize_tensor(self, w: torch.Tensor, layer_name, quant_act=False, get_scale_zp=False, scaled=False,
+                               ori_w=False):
+        print("==> pseudo_quantize_tensor")
+        # RTN
+        if self.visualize:
+            # max_idx = self.max_channel_idxes[self.quanting_layer_idx]
+            # min_idx = self.min_channel_idxes[self.quanting_layer_idx]
+            max_idx = self.max_channel_idxes[-1]
+            min_idx = self.min_channel_idxes[-1]
+
         # w: grouped weights [131072, 128]
         # print("==> pseudo_quantize_tensor")
         org_w_shape = w.shape
@@ -66,7 +83,7 @@ class AwqQuantizer:
         # print("==> max_val.shape: {}".format(max_val.shape))
         # print("==> min_val.shape: {}".format(min_val.shape))
         # TODO: 这里也使用了clamp，有可能也有问题
-        # 最小值里0之间的刻度值
+        # 最小值离0之间的刻度值
         zeros = (-torch.round(min_val / scales)).clamp_(min_int, max_int)
 
         assert torch.isnan(scales).sum() == 0
@@ -79,23 +96,28 @@ class AwqQuantizer:
         w = (torch.clamp(torch.round(w / scales) + zeros, min_int, max_int) - zeros)
 
         if self.visualize and layer_name != "":
-            self.print_channel_hist_plot(w.view(org_w_shape).cpu(), layer_name, self.max_channel_idxes[self.quanting_layer_idx],
-                                         print_type="{}quant-wo-steped_{}_W-Dis_maxC"
-                                         .format("ori-w_" if ori_w else "", "" if scaled else "wo-scaled_"))
-            self.print_channel_hist_plot(w.view(org_w_shape).cpu(), layer_name, self.min_channel_idxes[self.quanting_layer_idx],
-                                         print_type="{}quant-wo-steped_{}_W-Dis_minC"
-                                         .format("ori-w_" if ori_w else "", "" if scaled else "wo-scaled_"))
+            self.print_channel_hist_plot(w.view(org_w_shape).cpu(), layer_name, max_idx,
+                                         print_type="{}quant-wo-steped_{}_{}-Dis_maxC"
+                                         .format("ori-w_" if ori_w else "", "" if scaled else "wo-scaled_",
+                                                 "Act" if quant_act else "W"))
+            self.print_channel_hist_plot(w.view(org_w_shape).cpu(), layer_name, min_idx,
+                                         print_type="{}quant-wo-steped_{}_{}-Dis_minC"
+                                         .format("ori-w_" if ori_w else "", "" if scaled else "wo-scaled_",
+                                                 "Act" if quant_act else "W"))
 
-        w = w * scales
-        assert torch.isnan(w).sum() == 0
-
-        w = w.reshape(org_w_shape)
-
-        if get_scale_zp:
-            return w, scales.view(w.shape[0], -1), zeros.view(w.shape[0], -1)
+        if self.a_quant:
+            return w, scales
         else:
-            return w
-    
+            w = w * scales
+            assert torch.isnan(w).sum() == 0
+
+            w = w.reshape(org_w_shape)
+
+            if get_scale_zp:
+                return w, scales.view(w.shape[0], -1), zeros.view(w.shape[0], -1)
+            else:
+                return w
+
     def pseudo_dequantize_tensor(self, w: nn.Linear, scales: torch.Tensor, zeros: torch.Tensor):
         # get repeated count
         repeat_count = w.weight.data.shape[-1] // zeros.shape[-1]
@@ -108,17 +130,18 @@ class AwqQuantizer:
         w = (w.weight.data - zeros) * scales
 
         return w
-    
+
     def _exclude_layers_to_not_quantize(self, linear_layers):
         filtered_layers = {}
         for name, linear_layer in linear_layers.items():
             if not any(key in name for key in self.modules_to_not_convert):
                 filtered_layers[name] = linear_layer
         return filtered_layers
-    
+
     def quantize(self):
         # for block
         for i in tqdm(range(len(self.modules)), desc="AWQ"):
+            i = 31
             self.quanting_layer_idx = i
             # Move module and inputs to correct device
             common_device = next(self.modules[i].parameters()).device
@@ -148,7 +171,12 @@ class AwqQuantizer:
                 self.modules[i], input_feat, self.module_kwargs
             )
 
-            scales_list = [self._search_best_scale(self.modules[i], **layer) for layer in module_config]
+            # scales_list = [self._search_best_scale(self.modules[i], **layer) for layer in module_config]
+
+            # only for test
+            scales_list = [self._search_best_scale(self.modules[i], **module_config[2])]
+            exit(0)
+
             apply_scale(self.modules[i], scales_list, input_feat_dict=input_feat)
             scales_list = append_str_prefix(scales_list, get_op_name(self.model, self.modules[i]) + ".")
 
@@ -160,12 +188,14 @@ class AwqQuantizer:
             # [STEP 4]: Quantize weights
             self._apply_quant(self.modules[i], named_linears)
             clear_memory()
-    
+
     def _apply_quant(self, module, named_linears: Dict[str, nn.Linear]):
+        print("==> _apply_quant")
         for name, linear_layer in named_linears.items():
             # NOTE: small regression in perplexity if linear layer uses .cpu().float()
             linear_layer = linear_layer.cuda().half()
 
+            # RTN量化后结果，均匀量化步长，均匀量化zero point
             linear_layer.weight.data, scales, zeros = self.pseudo_quantize_tensor(
                 linear_layer.weight.data,
                 layer_name="",
@@ -177,14 +207,15 @@ class AwqQuantizer:
                 zeros = zeros.t().contiguous()
                 q_linear_module = WQLinear_GEMM
 
-            elif self.version  == 'GEMV':
+            elif self.version == 'GEMV':
                 q_linear_module = WQLinear_GEMV
-            
+
             q_linear = q_linear_module.from_linear(
                 linear=linear_layer,
                 w_bit=self.w_bit,
                 group_size=self.group_size,
                 init_only=False,
+                a_quant=self.a_quant,
                 scales=scales,
                 zeros=zeros
             )
@@ -195,17 +226,18 @@ class AwqQuantizer:
             clear_memory()
 
     @torch.no_grad()
-    def _search_best_scale(self, module, layer_name, prev_op, layers: List[nn.Linear], inp: torch.Tensor, module2inspect=None, kwargs={}):
+    def _search_best_scale(self, module, layer_name, prev_op, layers: List[nn.Linear], inp: torch.Tensor,
+                           module2inspect=None, kwargs={}):
         print("==> _search_best_scale")
         # print("==> len(layers): {}".format(len(layers)))
         self.layer_name = layers
         if module2inspect is None:
             assert len(layers) == 1
             module2inspect = layers[0]
-        
+
         if "use_cache" in kwargs:
             kwargs.pop("use_cache")
-        
+
         # Put x on the right device
         inp = inp.to(next(module2inspect.parameters()).device)
 
@@ -213,6 +245,42 @@ class AwqQuantizer:
         # [4096*3(QKV) = 12288, 4096]
         weight = torch.cat([_m.weight for _m in layers], dim=0)
         org_shape = weight.shape
+
+        # print heatmap
+        # vis_W = weight[:org_shape[1],]
+        # self.print_heatmap_plot(vis_W, layer_name, print_type="ori_W_q")
+        # print("inp.shape: {}".format(inp.shape))
+        # X_shape = inp.shape
+        # cut_seq_len = int(org_shape[1]/X_shape[1])
+        # print("cut_seq_len: {}".format(cut_seq_len))
+        # vis_X = inp[:cut_seq_len, :, :]
+        # print("vis_X.shape: {}".format(vis_X.shape))
+        # vis_X = vis_X.reshape(-1, vis_X.shape[-1])
+        # self.print_heatmap_plot(vis_X, layer_name, print_type="ori_X")
+        #
+        # # 4096
+        # dis_vis_X = inp.reshape(-1, inp.shape[-1]).cpu()
+        # print("==> fp16_output.shape: {}".format(dis_vis_X.shape))
+        #
+        # self.print_channel_plot(dis_vis_X, layer_name, print_type="ori_X")
+        #
+        # # reorder
+        # mean_values, _ = torch.max(torch.abs(dis_vis_X), dim=0)
+        # # mean_values = torch.mean(dis_vis_X)
+        # # 找到具有最大平均值的通道索引，并排序得到最大的 128 个通道索引
+        # # top_indices = torch.topk(mean_values, k=128).indices
+        # # top_indices = torch.argsort(mean_values)[:256]
+        # top_indices = torch.argsort(mean_values)[-128:]
+        # # top_indices, _ = torch.sort(top_indices)
+        # print(top_indices.shape)
+        # print(top_indices)
+        # remaining_indices = torch.tensor([i for i in range(dis_vis_X.shape[1]) if i not in top_indices])
+        #
+        # # 将剩余通道按序向前移动128个位置
+        # reorder_vis_X = torch.cat((dis_vis_X[:, remaining_indices], dis_vis_X[:, top_indices]), dim=1)
+        # self.print_channel_plot(reorder_vis_X, layer_name, print_type="reorder_X")
+        # exit(0)
+
         # print("==> weight.shape: {}".format(weight.shape))
         # [4096*(4096/128) = 391216, 128]
         weight = weight.view(-1, self.group_size) if self.group_size > 0 else weight
@@ -238,7 +306,10 @@ class AwqQuantizer:
                 fp16_output = fp16_output[0]
         # print("==> fp16_output.shape: {}".format(fp16_output.shape))
         if self.visualize:
-            self.print_channel_plot(fp16_output, layer_name, print_type="ori")
+            # self.print_channel_plot(fp16_output, layer_name, print_type="ori_output")
+            self.print_channel_plot(inp, layer_name, print_type="ori_inp")
+
+        exit(0)
 
         # [STEP 4]: Compute loss
         best_scales = self._compute_best_scale(
@@ -251,72 +322,128 @@ class AwqQuantizer:
     def print_channel_plot(self, fp16_output_, layer_name, print_type):
         # print("==> print_channel_plot")
         fp16_output = fp16_output_.view(-1, fp16_output_.shape[-1]).cpu()
-        # print("==> fp16_output.shape: {}".format(fp16_output.shape))
+        print("==> fp16_output.shape: {}".format(fp16_output.shape))
 
         save_path = os.path.join(self.vis_path, "layer-{}".format(self.quanting_layer_idx), layer_name)
         # 保存图表为图片
         if not os.path.exists(save_path):
             os.makedirs(save_path)
+        print(save_path)
 
         # 计算每个通道的最大值和最小值
-        max_values = torch.amax(fp16_output, dim=0)
-        min_values = torch.amin(fp16_output, dim=0)
+        # max_values = torch.amax(fp16_output, dim=0)
+        # min_values = torch.amin(fp16_output, dim=0)
+
+        max_values = torch.mean(fp16_output, dim=0)
+        min_values = torch.mean(fp16_output, dim=0)
         # print("==> max_values.shape: {}".format(max_values.shape))
 
         max_max_value, max_max_channel_idx = torch.max(max_values, dim=0)
         min_min_value, min_min_channel_idx = torch.min(min_values, dim=0)
+
+
+        max_values111 = torch.amax(fp16_output, dim=0)
+        min_values111 = torch.mean(fp16_output, dim=0)
+        _, max_max_channel_idx11 = torch.max(max_values111, dim=0)
+        _, min_min_channel_idx11 = torch.min(min_values111, dim=0)
+
+        # max_max_channel_idx = random.randint(0, 4096)
+        # min_min_channel_idx = random.randint(0, 4096)
         # min_max_value, max_min_channel_idx = torch.min(max_values, dim=0)
         # max_min_value, min_max_channel_idx = torch.max(min_values, dim=0)
         self.max_channel_idxes.append(max_max_channel_idx)
         self.min_channel_idxes.append(min_min_channel_idx)
 
         # print channel hist plot
-        self.print_channel_hist_plot(fp16_output, layer_name, self.max_channel_idxes[self.quanting_layer_idx],
-                                     print_type="{}_C-Act-dis_maxC".format(print_type))
-        self.print_channel_hist_plot(fp16_output, layer_name, self.min_channel_idxes[self.quanting_layer_idx],
-                                     print_type="{}_C-Act-dis_minC".format(print_type))
+        # self.print_channel_hist_plot(fp16_output, layer_name, self.max_channel_idxes[self.quanting_layer_idx],
+        #                              print_type="{}_Act-dis_maxC".format(print_type))
+        # self.print_channel_hist_plot(fp16_output, layer_name, self.min_channel_idxes[self.quanting_layer_idx],
+        #                              print_type="{}_Act-dis_minC".format(print_type))
+        # # 1368
+        # self.print_channel_hist_plot(fp16_output[:, 1368], layer_name, 1368, print_type="{}".format(print_type))
+        # # 2317
+        # self.print_channel_hist_plot(fp16_output[:, 2317], layer_name, 2317, print_type="{}".format(print_type))
+        # #3968
+        # self.print_channel_hist_plot(fp16_output[:, 3968], layer_name, 3968, print_type="{}".format(print_type))
+        #
+        # # 1368
+        # self.print_channel_hist_plot((fp16_output[:, 1368]-0.505), layer_name, 1368, print_type="{}_shift".format(print_type))
+        # # 2317
+        # self.print_channel_hist_plot((fp16_output[:, 2317] + 0.9), layer_name, 2317, print_type="{}_shift".format(print_type))
+        # # 3968
+        # self.print_channel_hist_plot((fp16_output[:, 3968] + 0.895), layer_name, 3968, print_type="{}_shift".format(print_type))
+
+        # # 1368
+        # self.print_channel_hist_plot((fp16_output[:, 1368]-0.505), layer_name, 1368, print_type="{}_scaled".format(print_type))
+        # # 2317
+        # self.print_channel_hist_plot((fp16_output[:, 2317]+0.9), layer_name, 2317, print_type="{}_scaled".format(print_type))
+        #3968
+        self.print_channel_hist_plot((fp16_output[:, 3968]+0.895)/5, layer_name, 3968, print_type="{}_scaled".format(print_type))
+
 
         # 获取通道的数量（C）
         num_channels = fp16_output.shape[1]
         # 创建一个新的图表
         # fig, ax = plt.subplots(figsize=(20, 15))
         # font_size = 36  # 调整这个值来改变字体大小
-        fig, ax = plt.subplots(figsize=(8, 6))
+        fig, ax = plt.subplots(figsize=(10, 6))
         font_size = 12  # 调整这个值来改变字体大小
         channel_ids = range(num_channels)
-        max_bars = ax.bar(channel_ids, max_values, width=1, color='blue', label='Max Value')
-        min_bars = ax.bar(channel_ids, min_values, width=1, color='orange', label='Min Value')
+
+        # zip vector
+        # down_sample_rate = 16
+        # sampler = [i for i in range(num_channels) if i % down_sample_rate == 0]
+        # sample_rate = int(num_channels / down_sample_rate)
+        # channel_ids = range(sample_rate)
+        # num_channels = sample_rate
+        # max_values = max_values[sampler]
+        # min_values = min_values[sampler]
+        # print("==> max_values.shape: {}".format(max_values.shape))
+
+        # mean_values = torch.mean(fp16_output, dim=0)
+        # max_bars = ax.bar(channel_ids, max_values, width=1, color='steelblue', label='Max Value')
+        # min_bars = ax.bar(channel_ids, min_values, width=1, color='steelblue', label='Min Value')
+
+        # max_bars = ax.bar(channel_ids, max_values, width=16, color='steelblue', label='Max Value')
+        # min_bars = ax.bar(channel_ids, min_values, width=16, color='steelblue', label='Min Value')
+
+        max_bars = ax.bar(channel_ids[:-128], max_values[:-128], width=16, color='steelblue', label='Max Value')
+        min_bars = ax.bar(channel_ids[:-128], min_values[:-128], width=16, color='steelblue', label='Min Value')
+        max_bars = ax.bar(channel_ids[-128:], max_values[-128:], width=16, color='coral', label='Max Value')
+        min_bars = ax.bar(channel_ids[-128:], min_values[-128:], width=16, color='coral', label='Min Value')
+
         # 标注最大值和最小值
         max_value_index = max_values.argmax().item()
         min_value_index = min_values.argmin().item()
 
         # 添加文本标签
-        ax.text(max_value_index, max_values[max_value_index], f'Max Value: {max_values[max_value_index]:.2f}',
-                ha='right', va='bottom', color='red', fontsize=font_size)
-        ax.text(min_value_index, min_values[min_value_index], f'Min Value: {min_values[min_value_index]:.2f}',
-                ha='right', va='bottom', color='red', fontsize=font_size)
+        # ax.text(max_value_index, max_values[max_value_index], f'Max Value: {max_values[max_value_index]:.2f}',
+        #         ha='right', va='bottom', color='red', fontsize=font_size)
+        # ax.text(min_value_index, min_values[min_value_index], f'Min Value: {min_values[min_value_index]:.2f}',
+        #         ha='right', va='bottom', color='red', fontsize=font_size)
 
         # 设置图表标题和轴标签
-        ax.set_title('{} Max and Min Values Across Channels-layer{}-{}'
-                     .format(print_type, self.quanting_layer_idx, layer_name), fontsize=font_size)
+        # ax.set_title('{} Max and Min Values Across Channels-layer{}-{}'
+        #              .format(print_type, self.quanting_layer_idx, layer_name), fontsize=font_size)
         ax.set_xlabel('Channel ID', fontsize=font_size)
         ax.set_ylabel('Values', fontsize=font_size)
 
         # 设置x轴范围为0到4096
-        ax.set_xlim(0, num_channels)
+        plt.xticks([i for i in range(num_channels) if i % 1000 == 0])
+        ax.set_xlim(-50, num_channels + 50)
         # 调整图表边缘紧贴
         # plt.subplots_adjust(left=0.05, right=0.98, top=0.95, bottom=0.15)
 
         # 高亮离群值
         outlier_linewidth = 1
-        for bar, value in zip(min_bars, min_values):
-            if value <= min_values.max() * 10:
-                bar.set_linewidth(outlier_linewidth)
-                bar.set_edgecolor("orange")
-        for bar, value in zip(max_bars, max_values):
-            if value >= max_values.min() * 10:
-                bar.set_linewidth(outlier_linewidth)
-                bar.set_edgecolor("blue")
+        # for bar, value in zip(min_bars, min_values):
+        #     if value <= min_values.max() * 10:
+        #         bar.set_linewidth(outlier_linewidth)
+        #         bar.set_edgecolor("coral")
+        # for bar, value in zip(max_bars, max_values):
+        #     if value >= max_values.min() * 10:
+        #         bar.set_linewidth(outlier_linewidth)
+        #         bar.set_edgecolor("coral")
 
         # 调整y轴刻度标签字体大小
         ax.tick_params(axis='y', labelsize=font_size)
@@ -328,9 +455,9 @@ class AwqQuantizer:
         # plt.show() # 假设fp16_output是你的 torch.tensor 向量
         plt.close()
 
-    def print_channel_hist_plot(self, input, layer_name, channel_idx, print_type):
+    def print_channel_hist_plot(self, values, layer_name, channel_idx, print_type):
         # print("==> print_channel_hist_plot")
-        values = input[:, channel_idx]
+        # values = input[:, channel_idx]
 
         save_path = os.path.join(self.vis_path, "layer-{}".format(self.quanting_layer_idx), layer_name)
         # 保存图表为图片
@@ -340,26 +467,73 @@ class AwqQuantizer:
         save_path = os.path.join(save_path, "{}_channel-{}.png"
                                  .format(print_type, channel_idx))
 
-        fig, ax = plt.subplots(figsize=(8, 6))
+        fig, ax = plt.subplots(figsize=(10, 6))
         # 使用直方图表示激活值的分布情况
-        ax.hist(values, bins=150, color='blue')
+        # ax.hist(values, bins=750, color='steelblue', range=[-10, 10])
+        ax.hist(values, bins=150, color='steelblue', range=[-2, 2])
 
         # 标注最大值和最小值
         max_value = values.max()
         min_value = values.min()
         # 添加文本标签
-        ax.text(max_value, 5, f'Max Value: {max_value:.2f}', ha='right', va='bottom', color='red', fontsize=10)
-        ax.text(min_value, 5, f'Min Value: {min_value:.2f}', ha='left', va='bottom', color='red', fontsize=10)
+        # ax.text(max_value, 5, f'{max_value:.2f}', ha='right', va='bottom', color='black', fontsize=10)
+        # ax.text(min_value, 5, f'{min_value:.2f}', ha='left', va='bottom', color='black', fontsize=10)
+        ax.set_title('{}_{}_max:{:.2f}_min:{:.2f}'
+                     .format(print_type, channel_idx, max_value, min_value))
 
         # 设置图表标题和轴标签
-        if 'weight' in print_type or 'W' in print_type:
-            ax.set_title('{} Distribution of Weight in Channel {}, Layer {}'
-                         .format(print_type, channel_idx, self.quanting_layer_idx))
-        else:
-            ax.set_title('{} Distribution of Activations in Channel {}, Layer {}'
-                         .format(print_type, channel_idx, self.quanting_layer_idx))
-        ax.set_xlabel('Value')
-        ax.set_ylabel('Frequency')
+        # if 'weight' in print_type or 'W' in print_type:
+        #     ax.set_title('{} Distribution of Weight in Channel {}, Layer {}'
+        #                  .format(print_type, channel_idx, self.quanting_layer_idx))
+        # else:
+        #     ax.set_title('{} Distribution of Activations in Channel {}, Layer {}'
+        #                  .format(print_type, channel_idx, self.quanting_layer_idx))
+        # ax.set_xlabel('Value')
+        # ax.set_ylabel('Frequency')
+        # plt.xticks([0])
+        plt.yticks([])
+        # ax.set_ylim([0, 1100])
+
+        # 保存图表为图片
+        plt.savefig(save_path)
+
+        plt.close()
+
+    def print_heatmap_plot(self, input, layer_name, print_type):
+        # only support [4096, 4096]
+        print("==> print_heatmap_plot")
+        # (32280, 4096)
+        print("input,shape: {}".format(input.shape))
+        # values, _ = torch.max(input, dim=1)
+        tensor_4d = input.view(32, 128, 32, 128)
+        # 在前两个维度上进行平均池化，压缩成 (32, 32) 的张量
+        compressed_tensor = torch.mean(torch.mean(tensor_4d, dim=1), dim=2)
+        values = compressed_tensor.cpu()
+        print("values,shape: {}".format(values.shape))
+
+        save_path = os.path.join(self.vis_path, "layer-{}".format(self.quanting_layer_idx), layer_name)
+        # 保存图表为图片
+        if not os.path.exists(save_path):
+            os.makedirs(save_path)
+
+        save_path = os.path.join(save_path, "{}_heatmap.png".format(print_type))
+        print(save_path)
+
+        fig, ax = plt.subplots(figsize=(10, 10))
+        # 使用直方图表示激活值的分布情况
+        ax.imshow(values, cmap=mpl.colormaps['Blues'])
+
+        # 设置图表标题和轴标签
+        # if 'weight' in print_type or 'W' in print_type:
+        #     ax.set_title('{} heatmap of Weight in Layer {}'
+        #                  .format(print_type, self.quanting_layer_idx))
+        # else:
+        #     ax.set_title('{} Distribution of Activations in Layer {}'
+        #                  .format(print_type, self.quanting_layer_idx))
+        # ax.set_xlabel('Value')
+        # ax.set_ylabel('Frequency')
+        plt.xticks([])
+        plt.yticks([])
 
         # 保存图表为图片
         plt.savefig(save_path)
@@ -367,7 +541,7 @@ class AwqQuantizer:
         plt.close()
 
     def _compute_best_scale(self, x, w_max, x_max, module2inspect, layer_name, linears2scale: List[nn.Linear],
-                                  fp16_output, kwargs={}):
+                            fp16_output, kwargs={}):
         """
         Compute loss and select best scales
 
@@ -385,38 +559,71 @@ class AwqQuantizer:
         best_error = float('inf')
 
         org_sd = {k: v.cpu() for k, v in module2inspect.state_dict().items()}
-        
+
         device = x.device
         # 其实是mean
         x_max = x_max.view(-1).to(device)
         w_max = w_max.view(-1).to(device)
 
         if self.visualize:
-            max_idx = self.max_channel_idxes[self.quanting_layer_idx]
-            min_idx = self.min_channel_idxes[self.quanting_layer_idx]
+            # max_idx = self.max_channel_idxes[self.quanting_layer_idx]
+            # min_idx = self.min_channel_idxes[self.quanting_layer_idx]
+            max_idx = self.max_channel_idxes[-1]
+            min_idx = self.min_channel_idxes[-1]
 
         # 使用网格搜索 1/1到20
-        for ratio in range(n_grid):
-            # create new scales
-            ratio = ratio / n_grid
-        # if True:
-        #     ratio = 0.6
+        # for ratio in range(n_grid):
+        #     # create new scales
+        #     ratio = ratio / n_grid
+        if True:
+            ratio = 0.6
 
-            # NOTE: s^-1 * x is fused here, according to paper
-            # 对应论文中的公式4，拿到 X * scale^-1, 此处用 X的平均来代替X
-            # TODO: 这里用了clamp，有可能将过于小的权重给略过了
+            # NOTE: s^-1 * x is fused here, according to paper 在 RTN的时候直接除
+            # 详情见 https://github.com/mit-han-lab/llm-awq/issues/58
             if self.duo_scaling:
-                scales = (x_max.pow(ratio) / w_max.pow(1-ratio)).clamp(min=1e-4)
+                # smooth quant
+                scales = (x_max.pow(ratio) / w_max.pow(1 - ratio)).clamp(min=1e-4)
             else:
+                # AWQ
                 scales = x_max.pow(ratio).clamp(min=1e-4).view(-1)
             # [4096]
+            # norm
             scales = scales / (scales.max() * scales.min()).sqrt()
             # [1, 4096]
             scales_view = scales.view(1, -1).to(device)
 
+            if self.a_quant:
+                print("==> quant X")
+                print("==> x.shape: {}".format(x.shape))
+                print("==> fc.weight.data.shape: {}".format(linears2scale[0].weight.data.shape))
+                org_x_shape = x.shape
+                x = x.reshape(-1, org_x_shape[-1])
+                x, x_scales = self.pseudo_quantize_tensor(x, layer_name=layer_name, quant_act=True, scaled=True)
+
+                x = x * x_scales
+                x = x.reshape(-1, org_x_shape[-1])
+
+                print("==> x.shape: {}".format(x.shape))
+                print("==> x_scales.shape: {}".format(x_scales.shape))
+
+                if self.visualize:
+                    self.print_channel_hist_plot(x.cpu(), layer_name, max_idx,
+                                                 print_type="quanted_Act-dis_maxC")
+                    self.print_channel_hist_plot(x.cpu(), layer_name, min_idx,
+                                                 print_type="quanted_Act-dis_minC")
+
+                    self.print_channel_hist_plot((x / scales_view).cpu(), layer_name, max_idx,
+                                                 print_type="quanted-div-scale_Act-dis_maxC")
+                    self.print_channel_hist_plot((x / scales_view).cpu(), layer_name, min_idx,
+                                                 print_type="quanted-div-scale_Act-dis_minC")
+                exit(1)
+                x = x.reshape(org_x_shape)
+            # exit(1)
+
             # Q(W * s)
             # 拿到权重 W 量化并scale之后的权重
             for fc in linears2scale:
+                print("==> quant Weight")
                 # [4096, 4096]
                 if self.visualize:
                     self.print_channel_hist_plot(fc.weight.cpu(), layer_name, max_idx,
@@ -424,9 +631,9 @@ class AwqQuantizer:
                     self.print_channel_hist_plot(fc.weight.cpu(), layer_name, min_idx,
                                                  print_type="ori_W-Dis_minC")
 
-                quant_wo_scaled_fc_weight_data = self.pseudo_quantize_tensor(fc.weight.data,
-                                                                             layer_name=layer_name, ori_w=True)
                 if self.visualize:
+                    quant_wo_scaled_fc_weight_data = self.pseudo_quantize_tensor(fc.weight.data,
+                                                                                layer_name=layer_name, ori_w=True)
                     self.print_channel_hist_plot(quant_wo_scaled_fc_weight_data.cpu(), layer_name, max_idx,
                                                  print_type="ori-quanted_W-Dis_maxC")
                     self.print_channel_hist_plot(quant_wo_scaled_fc_weight_data.cpu(), layer_name, min_idx,
@@ -439,14 +646,27 @@ class AwqQuantizer:
                                                  print_type="scaled_W-Dis_maxC")
                     self.print_channel_hist_plot(fc.weight.cpu(), layer_name, min_idx,
                                                  print_type="scaled_W-Dis_minC")
-                # RTN 最近邻量化
 
-                fc.weight.data = self.pseudo_quantize_tensor(fc.weight.data, layer_name=layer_name, scaled=True) / scales_view
-                if self.visualize:
-                    self.print_channel_hist_plot(fc.weight.cpu(), layer_name, max_idx,
-                                                 print_type="quanted_W-Dis_maxC")
-                    self.print_channel_hist_plot(fc.weight.cpu(), layer_name, min_idx,
-                                                 print_type="quanted_W-Dis_minC")
+                # RTN 最近邻量化
+                # /scale_view 表示已经 fuse 了s^-1
+
+                if self.a_quant:
+                    fc.weight.data, w_scales = self.pseudo_quantize_tensor(fc.weight.data, layer_name=layer_name, scaled=True)
+
+                else:
+                    fc.weight.data = self.pseudo_quantize_tensor(fc.weight.data, layer_name=layer_name, scaled=True)
+                    if self.visualize:
+                        self.print_channel_hist_plot(fc.weight.cpu(), layer_name, max_idx,
+                                                     print_type="quanted-wo-div-scale_W-Dis_maxC")
+                        self.print_channel_hist_plot(fc.weight.cpu(), layer_name, min_idx,
+                                                     print_type="quanted-wo-div-scale_W-Dis_minC")
+
+                    fc.weight.data = fc.weight.data / scales_view
+                    if self.visualize:
+                        self.print_channel_hist_plot(fc.weight.cpu(), layer_name, max_idx,
+                                                     print_type="quanted_W-Dis_maxC")
+                        self.print_channel_hist_plot(fc.weight.cpu(), layer_name, min_idx,
+                                                     print_type="quanted_W-Dis_minC")
 
             # W * X
             int_w_output = module2inspect(x, **kwargs)
@@ -455,7 +675,7 @@ class AwqQuantizer:
             # print("==> int_w_output.shape: {}".format(int_w_output.shape))
 
             # compute mean squared error (L2 norm)
-            loss = (fp16_output - int_w_output).float().pow(2).mean().item() # NOTE: float prevents overflow
+            loss = (fp16_output - int_w_output).float().pow(2).mean().item()  # NOTE: float prevents overflow
 
             history.append(loss)
             if loss < best_error:
@@ -466,9 +686,9 @@ class AwqQuantizer:
                 int_w_output_ = int_w_output.view(-1, int_w_output.shape[-1]).cpu()
                 if self.visualize:
                     self.print_channel_hist_plot(int_w_output_, layer_name, max_idx,
-                                                 print_type="quanted_C-Act-dis_maxC")
+                                                 print_type="quanted_out-Act-dis_maxC")
                     self.print_channel_hist_plot(int_w_output_, layer_name, min_idx,
-                                                 print_type="quanted_C-Act-dis_minC")
+                                                 print_type="quanted_out-Act-dis_minC")
             module2inspect.load_state_dict(org_sd)
 
         if best_ratio == -1:
@@ -495,11 +715,12 @@ class AwqQuantizer:
             clip_list.append((name, max_val))
 
             named_linears[name].cpu()
-        
+
         return clip_list
 
     @torch.no_grad()
-    def _compute_best_clip(self, w: torch.Tensor, input_feat: torch.Tensor, n_grid=20, max_shrink=0.5, n_sample_token=512):
+    def _compute_best_clip(self, w: torch.Tensor, input_feat: torch.Tensor, n_grid=20, max_shrink=0.5,
+                           n_sample_token=512):
         assert w.dim() == 2
         org_w_shape = w.shape
         # org_w_shape: torch.Size([4096, 11008])
@@ -510,6 +731,9 @@ class AwqQuantizer:
         # input_feat  [n_token, ci] -> [1, n_token, n_group, group size]
         group_size = self.group_size if self.group_size > 0 else w.shape[1]
         input_feat = input_feat.view(-1, input_feat.shape[-1])
+
+        if self.a_quant:
+            input_feat = self.pseudo_quantize_tensor(input_feat, layer_name="")
         input_feat = input_feat.reshape(1, input_feat.shape[0], -1, group_size)
         input_feat = input_feat[:, 0::input_feat.shape[1] // n_sample_token]
         w = w.reshape(w.shape[0], 1, -1, group_size)
@@ -519,6 +743,7 @@ class AwqQuantizer:
         w_all = w
         best_max_val_all = []
 
+        # for each group
         for i_b in range(w.shape[0] // oc_batch_size):
             w = w_all[i_b * oc_batch_size: (i_b + 1) * oc_batch_size]
 
@@ -538,6 +763,7 @@ class AwqQuantizer:
                 cur_out = (input_feat * q_w).sum(dim=-1)
 
                 # co, 1, n_group, 1
+                # MSE loss
                 err = (cur_out - org_out).pow(2).mean(dim=1).view(min_errs.shape)
                 del cur_w
                 del cur_out
@@ -567,7 +793,7 @@ class AwqQuantizer:
 
         modules[0] = modules[0].cuda()
         self.awq_model.move_embed(self.model, "cuda")
-        
+
         # get input and kwargs to layer 0
         # with_kwargs is only supported in PyTorch 2.0
         # use this Catcher hack for now
@@ -595,7 +821,7 @@ class AwqQuantizer:
             self.model(samples.to(next(self.model.parameters()).device))
         except ValueError:  # work with early exit
             pass
-        
+
         # Update the layer kwargs with `prepare_inputs_for_generation` method
         # that takes care of everything to avoid unexpected errors.
         layer_kwargs = self.model.prepare_inputs_for_generation(samples, **layer_kwargs)
@@ -610,16 +836,17 @@ class AwqQuantizer:
 
         modules[0] = modules[0].cpu()
         self.awq_model.move_embed(self.model, "cpu")
-        
+
         clear_memory()
-        
+
         if layer_kwargs.get("attention_mask") is not None:
             layer_kwargs["attention_mask"] = layer_kwargs["attention_mask"].to("cuda")
 
         return modules, layer_kwargs, inps
-    
+
     def _get_input_feat(self, layer, named_linears):
         print("==> _get_input_feat")
+
         # firstly, get input features of all linear layers
         def cache_input_hook(m, x, y, name, feat_dict):
             x = x[0]
@@ -631,7 +858,7 @@ class AwqQuantizer:
         for name in named_linears:
             handles.append(named_linears[name].register_forward_hook(
                 functools.partial(cache_input_hook, name=name,
-                                feat_dict=input_feat)))
+                                  feat_dict=input_feat)))
         self.inps = self.inps.to(next(layer.parameters()).device)  # in case multi-gpu
         # [bs, sequence_len, hidden state] -> [65, 512, 4096]
         # "hidden_size": 4096,
@@ -639,7 +866,7 @@ class AwqQuantizer:
         # "intermediate_size": 11008,
         print("==> self.inps.shape: {}".format(self.inps.shape))
         # get output as next layer's input
-        
+
         # Sanitize the kwargs in case we use transformers version that contains
         # kwargs that are not handled by the module.
         # Useful for trust_remote_code models.
@@ -655,9 +882,8 @@ class AwqQuantizer:
         # ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj',
         # 'self_attn.o_proj', 'mlp.gate_proj', 'mlp.up_proj', 'mlp.down_proj']
         # print("==> input_feat.keys(): {}".format(input_feat.keys()))
-        
-        return input_feat
 
+        return input_feat
 
     def _sanitize_kwargs(self, inputs_kwargs, module):
         """
@@ -673,7 +899,7 @@ class AwqQuantizer:
         """
         module_signature = inspect.signature(module.forward).parameters
         sanitized_kwargs = {}
-        for k, v in  inputs_kwargs.items():
+        for k, v in inputs_kwargs.items():
             if k in module_signature:
                 sanitized_kwargs[k] = v
         return sanitized_kwargs

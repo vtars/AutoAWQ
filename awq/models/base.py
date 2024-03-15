@@ -26,42 +26,46 @@ from accelerate.big_modeling import (
 )
 from accelerate.utils import get_balanced_memory
 
+
 class BaseAWQForCausalLM(nn.Module):
     def __init__(self, model, model_type, is_quantized, config, quant_config):
         super().__init__()
-        self.model:PreTrainedModel = model
-        self.model_type:str = model_type
-        self.is_quantized:bool = is_quantized
+        self.model: PreTrainedModel = model
+        self.model_type: str = model_type
+        self.is_quantized: bool = is_quantized
         self.search_result = None
         self.config: PretrainedConfig = config
         self.quant_config: AwqConfig = quant_config
-    
+
     def to(self, device: str):
         return self.model.to(device)
-    
+
     def forward(self, *args, **kwargs):
         return self.model(*args, **kwargs)
-    
+
     def generate(self, *args, **kwargs):
         with torch.inference_mode():
             return self.model.generate(*args, **kwargs)
 
     @torch.no_grad()
     def quantize(self, tokenizer=None, quant_config={},
-                       calib_data: Union[str, List[str]]="pileval", 
-                       split="train", text_column="text", duo_scaling=True, modules_to_not_convert=None):
+                 calib_data: Union[str, List[str]] = "pileval",
+                 split="train", text_column="text", duo_scaling=True, modules_to_not_convert=None):
         self.quant_config: AwqConfig = AwqConfig.from_dict(quant_config)
-
         print("==> self.quant_config: {}".format(self.quant_config))
+
         quantizer = AwqQuantizer(
-            self, self.model, tokenizer, self.quant_config.w_bit, self.quant_config.q_group_size,
+            self, self.model, tokenizer,
+            self.quant_config.rtn_q, self.quant_config.w_bit,
+            self.quant_config.a_quant, self.quant_config.a_bit,
+            self.quant_config.q_group_size,
             self.quant_config.version, self.quant_config.visualize, self.quant_config.vis_path,
             calib_data, split, text_column,
             duo_scaling, modules_to_not_convert=modules_to_not_convert
         )
         quantizer.quantize()
         self.is_quantized = True
-    
+
     @staticmethod
     def fuse_layers(model):
         pass
@@ -72,6 +76,7 @@ class BaseAWQForCausalLM(nn.Module):
         # Save model
         class EmptyModule(nn.Module):
             def __init__(self): super(EmptyModule, self).__init__()
+
             def forward(self, x): return x
 
         # Save model and config files with empty state dict
@@ -90,8 +95,8 @@ class BaseAWQForCausalLM(nn.Module):
 
         # shard checkpoint into chunks (10GB default)
         shards, index = shard_checkpoint(
-            self.model.state_dict(), 
-            max_shard_size=shard_size, 
+            self.model.state_dict(),
+            max_shard_size=shard_size,
             weights_name=model_name
         )
 
@@ -107,10 +112,9 @@ class BaseAWQForCausalLM(nn.Module):
         if index is not None:
             with open(f'{save_dir}/{model_name}.index.json', 'w+') as file:
                 file.write(json.dumps(index, indent=4))
-        
-        
+
     @classmethod
-    def from_pretrained(self, model_path, model_type, torch_dtype: torch.dtype = torch.float16, 
+    def from_pretrained(self, model_path, model_type, torch_dtype: torch.dtype = torch.float16,
                         trust_remote_code=True, safetensors=False, device_map=None,
                         **model_init_kwargs):
         # Get weights path and quant config
@@ -133,26 +137,27 @@ class BaseAWQForCausalLM(nn.Module):
         return self(model, model_type, is_quantized=False, config=config, quant_config=quant_config)
 
     @classmethod
-    def from_quantized(self, model_path, model_type, model_filename='', 
-                             max_new_tokens=None, torch_dtype=torch.float16, 
-                             trust_remote_code=True, safetensors=True, is_quantized=True, 
-                             fuse_layers=False, version='GEMM',
-                             device_map="balanced", offload_folder=None,
-                             **config_kwargs):
+    def from_quantized(self, model_path, model_type, model_filename='',
+                       max_new_tokens=None, torch_dtype=torch.float16,
+                       trust_remote_code=True, safetensors=True, is_quantized=True,
+                       fuse_layers=False, version='GEMM',
+                       device_map="balanced", offload_folder=None,
+                       **config_kwargs):
         # [STEP 1-2] Load weights path and configs
         model_weights_path, config, quant_config = self._load_config(
-            self, model_path, model_filename, safetensors, version, 
+            self, model_path, model_filename, safetensors, version,
             trust_remote_code, max_new_tokens=max_new_tokens,
             **config_kwargs
         )
-        
+
         # [STEP 3] Load model
         with init_empty_weights():
-            model = AutoModelForCausalLM.from_config(config=config, torch_dtype=torch_dtype, trust_remote_code=trust_remote_code)
-        
+            model = AutoModelForCausalLM.from_config(config=config, torch_dtype=torch_dtype,
+                                                     trust_remote_code=trust_remote_code)
+
         # Prepare WQLinear layers, replace nn.Linear
         self._load_quantized_modules(self, model, quant_config, quant_config.version)
-        
+
         model.tie_weights()
 
         # loads the weights into modules and distributes
@@ -165,16 +170,16 @@ class BaseAWQForCausalLM(nn.Module):
             offload_folder=offload_folder,
             dtype=torch_dtype,
         )
-        
+
         # Dispath to devices
         if fuse_layers:
             self.fuse_layers(model)
 
         return self(model, model_type, is_quantized=is_quantized, config=config, quant_config=quant_config)
 
-    def _load_config(self, model_path, model_filename, safetensors=True, 
-                           version="GEMM", trust_remote_code=True, max_new_tokens=4096,
-                           **config_kwargs):
+    def _load_config(self, model_path, model_filename, safetensors=True,
+                     version="GEMM", trust_remote_code=True, max_new_tokens=4096,
+                     **config_kwargs):
         # [STEP 1] Download model if path is not a directory
         if not os.path.isdir(model_path):
             ignore_patterns = ["*msgpack*", "*h5*", "optimizer.pt"]
@@ -182,9 +187,9 @@ class BaseAWQForCausalLM(nn.Module):
                 ignore_patterns.extend(["*.pt*", "*.bin*"])
             else:
                 ignore_patterns.append("*.safetensors*")
-            
+
             model_path = snapshot_download(model_path, ignore_patterns=ignore_patterns)
-        
+
         if model_filename != '':
             model_weights_path = model_path + f'/{model_filename}'
         else:
@@ -193,7 +198,7 @@ class BaseAWQForCausalLM(nn.Module):
         # [STEP 2] Load config and set sequence length
         # TODO: Create BaseAWQConfig class
         quant_config = AwqConfig.from_pretrained(model_path)
-        
+
         # Load model config and set max generation length
         if max_new_tokens is None and hasattr(self, 'max_new_tokens_key'):
             config = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code, **config_kwargs)
@@ -202,13 +207,13 @@ class BaseAWQForCausalLM(nn.Module):
             max_new_tokens = 2048 if max_new_tokens is None else max_new_tokens
             config = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code, **config_kwargs)
             config.max_new_tokens = max_new_tokens
-        
+
         return model_weights_path, config, quant_config
 
     def _load_quantized_modules(self, model, quant_config, version):
         # Real quantization of weights
         assert quant_config.zero_point, "We only support zero_point quantization now."
-        
+
         # Get blocks of model
         layers = self.get_model_layers(model)
 
@@ -227,19 +232,20 @@ class BaseAWQForCausalLM(nn.Module):
                     q_linear_module = WQLinear_GEMM
                 elif version == 'GEMV':
                     q_linear_module = WQLinear_GEMV
-                
+
                 q_linear = q_linear_module.from_linear(
                     module,
                     quant_config.w_bit,
                     quant_config.q_group_size,
-                    True
+                    True,
+                    self.quant_config.a_quant
                 )
                 q_linear.to(next(layer.parameters()).device)
                 set_op_by_name(layer, name, q_linear)
-            
+
             torch.cuda.empty_cache()
             gc.collect()
-    
+
     @staticmethod
     def _scale_activations(self, layer):
         scale_dict = self.get_act_for_scaling(layer)

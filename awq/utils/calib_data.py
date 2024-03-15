@@ -1,7 +1,7 @@
 import torch
 import logging
 from typing import List, Union
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 
 def get_calib_dataset(data: Union[str, List[str]] = "pileval",
                       tokenizer=None, n_samples=512, block_size=512,
@@ -9,7 +9,11 @@ def get_calib_dataset(data: Union[str, List[str]] = "pileval",
     print("==> get_calib_dataset")
     if isinstance(data, str):
         if data == "pileval":
-            dataset = load_dataset("mit-han-lab/pile-val-backup", split="validation")
+            dataset = load_from_disk('/home/data/dixiang/hsx/pileval')
+            # dataset = load_dataset("mit-han-lab/pile-val-backup", split="validation")
+            # dataset.save_to_disk('/home/data/dixiang/hsx/pileval')
+            # print("load and save done")
+            # exit(0)
         else:
             dataset = load_dataset(data, split=split)
         
